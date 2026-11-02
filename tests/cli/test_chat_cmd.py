@@ -830,9 +830,8 @@ class TestExplicitMCPTools:
         config.tools.mcp.enabled = True
         config.tools.mcp.servers = '[{"name":"centralhub"}]'
         tool = MagicMock()
-        tool.spec.name = "text_reverse"
-        tool.spec.required_capabilities = []
-        tool.spec.requires_confirmation = False
+        tool.spec = ToolSpec(name="text_reverse", description="Reverse text")
+        tool.is_local = True
         tool.execute.return_value = ToolResult(
             tool_name="text_reverse", content="ZYX-321-CBA", success=True
         )
@@ -847,7 +846,7 @@ class TestExplicitMCPTools:
             result = CliRunner().invoke(
                 chat,
                 ["--model", "test-model", "--agent", agent_name],
-                input=input_text + "\\n/quit\\n",
+                input=input_text + "\n/quit\n",
             )
         return result, tool, client
 
