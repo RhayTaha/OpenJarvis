@@ -282,7 +282,7 @@ class NativeReActAgent(ToolUsingAgent):
         requested_names = {
             name
             for name in available_names
-            if re.search(r"(?<![\\w])" + re.escape(name) + r"(?![\\w])", input)
+            if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", input)
         }
         retry_count = 0
         all_tool_results: list[ToolResult] = []
