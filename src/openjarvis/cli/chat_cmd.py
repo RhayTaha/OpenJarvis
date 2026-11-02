@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from typing import List, Optional
@@ -27,6 +28,28 @@ def _safe_rich_label(value: object) -> str:
     from openjarvis.cli._model_switch import sanitize_model_id
 
     return escape(sanitize_model_id(str(value)))
+
+
+def _strict_tool_args(raw: str) -> dict:
+    """Accept only bounded JSON objects for explicit /tool calls."""
+    if len(raw) > 4096:
+        raise ValueError("JSON arguments exceed 4096 characters")
+
+    def unique_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate JSON argument")
+            result[key] = value
+        return result
+
+    def reject_constant(value):
+        raise ValueError("Non-finite JSON number")
+
+    args = json.loads(raw, object_pairs_hook=unique_pairs, parse_constant=reject_constant)
+    if not isinstance(args, dict):
+        raise ValueError("Arguments must be one JSON object")
+    return args
 
 
 def _read_input(prompt: str = "You> ") -> Optional[str]:
@@ -106,6 +129,8 @@ def chat(
       /runtime      — Ollama context + GPU offload for this session
       /help         — show available commands
       /history      — show conversation history
+      /tools        — list tools available to this agent
+      /tool NAME JSON — execute an authorized tool explicitly
 
     Pass --voice to use microphone input (silence-detection) and hear responses
     read back via text-to-speech (kokoro local or OpenAI TTS).
@@ -197,6 +222,7 @@ def chat(
     # Resolve agent (optional)
     # Retain MCP sessions throughout the interactive chat, just as ask does.
     mcp_clients = []
+    chat_tools = []
     agent = None
     agent_key = agent_name or config.agent.default_agent
     if agent_key and agent_key != "none":
@@ -250,6 +276,7 @@ def chat(
                             tool_instances.append(mcp_tool)
                             existing.add(mcp_tool.spec.name)
                     if tool_instances:
+                        chat_tools = tool_instances
                         kwargs["tools"] = tool_instances
                     kwargs["max_turns"] = config.agent.max_turns
 
@@ -327,7 +354,7 @@ def chat(
         f"  Agent: [cyan]{_safe_rich_label(agent_key or 'direct')}[/cyan]\n"
         f"  Runtime: [cyan]{runtime_opts.summary(engine_name=engine_name)}[/cyan]\n"
         f"{voice_hint}"
-        f"  Type /help for commands, /quit to exit.\n",
+        f"  Type /help for commands, /tools for tool list, /quit to exit.\n",
     )
 
     # Background-work status banner (disappears after first user message)
@@ -435,8 +462,52 @@ def chat(
                 "  /model        — show model info\n"
                 "  /runtime      — Ollama context + GPU offload for this session\n"
                 "  /history      — show conversation\n"
+                "  /tools        — show available agent tools\n"
+                "  /tool NAME JSON — execute tool with JSON object arguments\n"
                 "  /help         — this message"
             )
+            continue
+        elif cmd == "/tools":
+            if not chat_tools or agent is None:
+                console.print("[yellow]No tools available to this chat agent.[/yellow]")
+            else:
+                for tool in chat_tools:
+                    console.print(f"  [cyan]{_safe_rich_label(tool.spec.name)}[/cyan]")
+            continue
+        elif cmd == "/tool" or cmd.startswith("/tool "):
+            # Explicit dispatch uses the same security-aware executor as agent actions.
+            parts = user_input.split(maxsplit=2)
+            if agent is None or not hasattr(agent, "_executor"):
+                console.print("[red]No tool-capable agent available.[/red]")
+                continue
+            if len(parts) != 3:
+                console.print("[yellow]Usage: /tool NAME {\"argument\":\"value\"}[/yellow]")
+                continue
+            name = parts[1]
+            if name not in {tool.spec.name for tool in chat_tools}:
+                console.print("[red]Unknown or unavailable tool.[/red]")
+                continue
+            try:
+                arguments = _strict_tool_args(parts[2])
+            except (ValueError, json.JSONDecodeError) as exc:
+                console.print(f"[red]Invalid tool arguments: {escape(str(exc))}[/red]")
+                continue
+            from openjarvis.core.types import ToolCall
+
+            from uuid import uuid4
+
+            result = agent._executor.execute(
+                ToolCall(
+                    id=f"cli_tool_{uuid4().hex}",
+                    name=name,
+                    arguments=json.dumps(arguments, ensure_ascii=False, allow_nan=False),
+                )
+            )
+            state = "OK" if result.success else "FAILED"
+            console.print(
+                f"[bold]Tool execution: {_safe_rich_label(name)} — {state}[/bold]"
+            )
+            console.print(escape(str(result.content)))
             continue
         elif cmd == "/history":
             if not history:
@@ -500,6 +571,12 @@ def chat(
                 content = (
                     response.content if hasattr(response, "content") else str(response)
                 )
+                for used_tool in getattr(response, "tool_results", []) or []:
+                    outcome = "OK" if used_tool.success else "FAILED"
+                    console.print(
+                        f"[dim]Tool executed: "
+                        f"{_safe_rich_label(used_tool.tool_name)} — {outcome}[/dim]"
+                    )
             else:
                 result = engine.generate(
                     generation_history,

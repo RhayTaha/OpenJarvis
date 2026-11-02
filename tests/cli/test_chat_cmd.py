@@ -819,3 +819,66 @@ class TestChatAgents:
 
         assert result.exit_code == 0, result.output
         discover.assert_called_once_with(config.tools.mcp, allowed_names={"text_stats"})
+
+
+class TestExplicitMCPTools:
+    def _run(self, input_text, discovered, *, agent_name="native_react"):
+        engine = MagicMock()
+        engine.engine_id = "mock"
+        config = JarvisConfig()
+        config.intelligence.default_model = "test-model"
+        config.tools.mcp.enabled = True
+        config.tools.mcp.servers = '[{"name":"centralhub"}]'
+        tool = MagicMock()
+        tool.spec.name = "text_reverse"
+        tool.spec.required_capabilities = []
+        tool.spec.requires_confirmation = False
+        tool.execute.return_value = ToolResult(
+            tool_name="text_reverse", content="ZYX-321-CBA", success=True
+        )
+        client = MagicMock()
+        with (
+            patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
+            patch("openjarvis.engine.get_engine", return_value=("mock", engine)),
+            patch("openjarvis.intelligence.register_builtin_models"),
+            patch("openjarvis.mcp.loader.load_mcp_tools_from_config",
+                  return_value=([tool] if discovered else [], [client])),
+        ):
+            result = CliRunner().invoke(
+                chat,
+                ["--model", "test-model", "--agent", agent_name],
+                input=input_text + "\\n/quit\\n",
+            )
+        return result, tool, client
+
+    def test_tools_lists_discovered_tools(self):
+        result, tool, client = self._run("/tools", True)
+        assert result.exit_code == 0, result.output
+        assert "text_reverse" in result.output
+        tool.execute.assert_not_called()
+        client.close.assert_called_once()
+
+    def test_direct_tool_dispatch_has_verifiable_output(self):
+        result, tool, client = self._run('/tool text_reverse {"text":"ABC-123-XYZ"}', True)
+        assert result.exit_code == 0, result.output
+        assert "Tool execution: text_reverse" in result.output
+        assert "ZYX-321-CBA" in result.output
+        tool.execute.assert_called_once_with(text="ABC-123-XYZ")
+        client.close.assert_called_once()
+
+    def test_unknown_tool_never_executes(self):
+        result, tool, _ = self._run('/tool adguard_admin {"x":1}', True)
+        assert result.exit_code == 0
+        assert "Unknown or unavailable tool" in result.output
+        tool.execute.assert_not_called()
+
+    def test_invalid_json_never_executes(self):
+        result, tool, _ = self._run('/tool text_reverse {"text":"A","text":"B"}', True)
+        assert result.exit_code == 0
+        assert "Invalid tool arguments" in result.output
+        tool.execute.assert_not_called()
+
+    def test_tool_unavailable_without_discovery(self):
+        result, _, _ = self._run('/tool text_reverse {"text":"ABC"}', False)
+        assert result.exit_code == 0
+        assert "Unknown or unavailable tool" in result.output

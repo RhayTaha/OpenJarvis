@@ -33,6 +33,11 @@ Action Input: <json arguments>
 Thought: <your reasoning>
 Final Answer: <your answer>
 
+If a user requests one of the tools listed below, issue an Action with its
+exact name and JSON object arguments before you answer. Do not claim a tool
+was executed unless you received an Observation containing its result.
+If no tool call was made, clearly say that you did not use a tool.
+
 # Using Skills
 
 Tools whose names begin with `skill_` are SKILLS. When you call a skill tool,
