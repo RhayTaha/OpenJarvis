@@ -840,8 +840,10 @@ class TestExplicitMCPTools:
             patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
             patch("openjarvis.engine.get_engine", return_value=("mock", engine)),
             patch("openjarvis.intelligence.register_builtin_models"),
-            patch("openjarvis.mcp.loader.load_mcp_tools_from_config",
-                  return_value=([tool] if discovered else [], [client])),
+            patch(
+                "openjarvis.mcp.loader.load_mcp_tools_from_config",
+                return_value=([tool] if discovered else [], [client]),
+            ),
         ):
             result = CliRunner().invoke(
                 chat,
@@ -858,7 +860,9 @@ class TestExplicitMCPTools:
         client.close.assert_called_once()
 
     def test_direct_tool_dispatch_has_verifiable_output(self):
-        result, tool, client = self._run('/tool text_reverse {"text":"ABC-123-XYZ"}', True)
+        result, tool, client = self._run(
+            '/tool text_reverse {"text":"ABC-123-XYZ"}', True
+        )
         assert result.exit_code == 0, result.output
         assert "Tool execution: text_reverse" in result.output
         assert "ZYX-321-CBA" in result.output
@@ -872,7 +876,9 @@ class TestExplicitMCPTools:
         tool.execute.assert_not_called()
 
     def test_invalid_json_never_executes(self):
-        result, tool, _ = self._run('/tool text_reverse {"text":"A","text":"B"}', True)
+        result, tool, _ = self._run(
+            '/tool text_reverse {"text":"A","text":"B"}', True
+        )
         assert result.exit_code == 0
         assert "Invalid tool arguments" in result.output
         tool.execute.assert_not_called()

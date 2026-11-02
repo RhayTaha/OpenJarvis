@@ -6,6 +6,7 @@ import json
 import logging
 import sys
 from typing import List, Optional
+from uuid import uuid4
 
 import click
 from rich.console import Console
@@ -489,12 +490,10 @@ def chat(
                 continue
             try:
                 arguments = _strict_tool_args(parts[2])
-            except (ValueError, json.JSONDecodeError) as exc:
+            except ValueError as exc:
                 console.print(f"[red]Invalid tool arguments: {escape(str(exc))}[/red]")
                 continue
             from openjarvis.core.types import ToolCall
-
-            from uuid import uuid4
 
             result = agent._executor.execute(
                 ToolCall(
