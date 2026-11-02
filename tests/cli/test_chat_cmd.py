@@ -747,3 +747,75 @@ class TestChatAgents:
         assert "chat executed!" not in result.output
         assert "Confirm:" not in result.output
         assert limiter.keys == ["tool_chat_agent:dangerous_chat"]
+
+    def test_chat_loads_mcp_tools_and_closes_clients(self) -> None:
+        engine = MagicMock()
+        engine.engine_id = "mock"
+        config = JarvisConfig()
+        config.intelligence.default_model = "test-model"
+        config.tools.mcp.enabled = True
+        config.tools.mcp.servers = '[{"name":"centralhub"}]'
+
+        class CapturingAgent(ToolUsingAgent):
+            agent_id = "mcp_chat_capture_agent"
+            received_names = []
+
+            def __init__(self, *args, tools=None, **kwargs):
+                self.__class__.received_names = [tool.spec.name for tool in tools or []]
+                super().__init__(*args, tools=tools, **kwargs)
+
+            def run(self, input, context=None, **kwargs):
+                return AgentResult(content="MCP ready", turns=1)
+
+        AgentRegistry.register_value("mcp_chat_capture_agent", CapturingAgent)
+        mcp_tool = MagicMock()
+        mcp_tool.spec.name = "analyze_hedge_scenario"
+        client = MagicMock()
+
+        with (
+            patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
+            patch("openjarvis.engine.get_engine", return_value=("mock", engine)),
+            patch("openjarvis.intelligence.register_builtin_models"),
+            patch(
+                "openjarvis.mcp.loader.load_mcp_tools_from_config",
+                return_value=([mcp_tool], [client]),
+            ) as discover,
+        ):
+            result = CliRunner().invoke(
+                chat,
+                ["--agent", "mcp_chat_capture_agent", "--model", "test-model"],
+                input="hello\n/quit\n",
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "MCP ready" in result.output
+        assert CapturingAgent.received_names == ["analyze_hedge_scenario"]
+        discover.assert_called_once_with(config.tools.mcp, allowed_names=None)
+        client.close.assert_called_once()
+
+    def test_chat_respects_explicit_mcp_tool_filter(self) -> None:
+        engine = MagicMock()
+        engine.engine_id = "mock"
+        config = JarvisConfig()
+        config.intelligence.default_model = "test-model"
+        config.tools.mcp.enabled = True
+        config.tools.mcp.servers = '[{"name":"centralhub"}]'
+
+        AgentRegistry.register_value("mcp_chat_capture_agent", _ToolChatAgent)
+        with (
+            patch("openjarvis.cli.chat_cmd.load_config", return_value=config),
+            patch("openjarvis.engine.get_engine", return_value=("mock", engine)),
+            patch("openjarvis.intelligence.register_builtin_models"),
+            patch(
+                "openjarvis.mcp.loader.load_mcp_tools_from_config",
+                return_value=([], []),
+            ) as discover,
+        ):
+            result = CliRunner().invoke(
+                chat,
+                ["--agent", "mcp_chat_capture_agent", "--model", "test-model", "--tools", "text_stats"],
+                input="/quit\n",
+            )
+
+        assert result.exit_code == 0, result.output
+        discover.assert_called_once_with(config.tools.mcp, allowed_names={"text_stats"})

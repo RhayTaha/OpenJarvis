@@ -195,6 +195,8 @@ def chat(
     engine = security.engine
 
     # Resolve agent (optional)
+    # Retain MCP sessions throughout the interactive chat, just as ask does.
+    mcp_clients = []
     agent = None
     agent_key = agent_name or config.agent.default_agent
     if agent_key and agent_key != "none":
@@ -231,8 +233,24 @@ def chat(
                                     )
                                 elif isinstance(tcls, BaseTool):
                                     tool_instances.append(tcls)
-                        if tool_instances:
-                            kwargs["tools"] = tool_instances
+                    else:
+                        tool_instances = []
+
+                    # External MCP tools must be available in interactive chat too.
+                    # An explicit --tools argument limits discovery by name.
+                    from openjarvis.mcp.loader import load_mcp_tools_from_config
+
+                    mcp_tools, mcp_clients = load_mcp_tools_from_config(
+                        config.tools.mcp,
+                        allowed_names=set(tool_names_list) if tools is not None else None,
+                    )
+                    existing = {tool.spec.name for tool in tool_instances}
+                    for mcp_tool in mcp_tools:
+                        if mcp_tool.spec.name not in existing:
+                            tool_instances.append(mcp_tool)
+                            existing.add(mcp_tool.spec.name)
+                    if tool_instances:
+                        kwargs["tools"] = tool_instances
                     kwargs["max_turns"] = config.agent.max_turns
 
                     def _confirm(prompt: str) -> bool:
@@ -515,6 +533,11 @@ def chat(
 
     if memory_service is not None:
         memory_service.stop()
+    for mcp_client in mcp_clients:
+        try:
+            mcp_client.close()
+        except Exception:
+            logger.warning("Failed to close MCP client", exc_info=True)
 
 
 __all__ = ["chat"]
