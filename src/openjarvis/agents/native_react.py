@@ -33,6 +33,15 @@ Action Input: <json arguments>
 Thought: <your reasoning>
 Final Answer: <your answer>
 
+If a user requests one of the tools listed below, issue an Action with its
+exact name and JSON object arguments before you answer. Do not claim a tool
+was executed unless you received an Observation containing its result.
+If no tool call was made, clearly say that you did not use a tool.
+Never invent an Observation: only the runtime can supply tool observations.
+The only callable tool names are those listed in the available tools section.
+Do not add a `skill_` prefix to a tool name that does not have one.
+If a tool fails, report the failure rather than pretending it succeeded.
+
 # Using Skills
 
 Tools whose names begin with `skill_` are SKILLS. When you call a skill tool,
@@ -265,6 +274,17 @@ class NativeReActAgent(ToolUsingAgent):
                 messages.insert(-1, Message(role=Role.USER, content=ex["input"]))
                 messages.insert(-1, Message(role=Role.ASSISTANT, content=ex["output"]))
 
+        # Only enforce tool use when the user explicitly names an installed tool.
+        # Do not infer a tool from arbitrary user requests or model-generated text.
+        # This prevents a small model from fabricating results when explicitly
+        # asked to execute a tool, without forcing tools on ordinary chat.
+        available_names = {tool.spec.name for tool in self._tools}
+        requested_names = {
+            name
+            for name in available_names
+            if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", input)
+        }
+        retry_count = 0
         all_tool_results: list[ToolResult] = []
         turns = 0
         total_usage: dict[str, int] = {
@@ -297,6 +317,51 @@ class NativeReActAgent(ToolUsingAgent):
                     metadata={
                         **total_usage,
                         "response_parse_error": parsed["parse_error"],
+                        "messages": [_message_to_dict(m) for m in messages],
+                    },
+                )
+
+            # The model is not allowed to claim success for a named tool
+            # without an actual successful ToolExecutor invocation.
+            pending_names = {
+                name
+                for name in requested_names
+                if not any(
+                    item.tool_name == name and item.success
+                    for item in all_tool_results
+                )
+            }
+            if pending_names and (parsed["final_answer"] or not parsed["action"]):
+                if retry_count < 1 and turns < self._max_turns:
+                    retry_count += 1
+                    # Never feed invented observations back as tool outputs.
+                    messages.append(
+                        Message(
+                            role=Role.USER,
+                            content=(
+                                "The requested tool has NOT executed successfully. "
+                                "Your previous response was not a tool result. "
+                                "Issue an Action with an exact available tool name "
+                                "and JSON object Action Input. "
+                                "Required tool names: "
+                                + ", ".join(sorted(pending_names))
+                                + ". Do not write an Observation yourself."
+                            ),
+                        )
+                    )
+                    continue
+                self._emit_turn_end(turns=turns)
+                return AgentResult(
+                    content=(
+                        "Tool execution was not verified for: "
+                        + ", ".join(sorted(pending_names))
+                        + ". No result is reported."
+                    ),
+                    tool_results=all_tool_results,
+                    turns=turns,
+                    metadata={
+                        **total_usage,
+                        "tool_execution_unverified": sorted(pending_names),
                         "messages": [_message_to_dict(m) for m in messages],
                     },
                 )
@@ -355,6 +420,27 @@ class NativeReActAgent(ToolUsingAgent):
             observation = f"Observation: {tool_result.content}"
             messages.append(Message(role=Role.USER, content=observation))
 
+        # A named tool that never succeeded must fail closed even if the
+        # model spent all turns proposing invalid actions.
+        unverified = {
+            name
+            for name in requested_names
+            if not any(item.tool_name == name and item.success for item in all_tool_results)
+        }
+        if unverified:
+            self._emit_turn_end(turns=turns)
+            return AgentResult(
+                content="Tool execution was not verified for: "
+                + ", ".join(sorted(unverified))
+                + ". No result is reported.",
+                tool_results=all_tool_results,
+                turns=turns,
+                metadata={
+                    **total_usage,
+                    "tool_execution_unverified": sorted(unverified),
+                    "messages": [_message_to_dict(m) for m in messages],
+                },
+            )
         # Max turns exceeded
         msg_dicts = [_message_to_dict(m) for m in messages]
         return self._max_turns_result(
