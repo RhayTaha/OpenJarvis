@@ -182,16 +182,39 @@ def _named_tool_contract_guidance(
                 for name, info in properties.items()
                 if isinstance(info, dict)
                 and info.get("type") in ("number", "integer")
+                and isinstance(
+                    info.get("maximum", info.get("exclusiveMaximum", 2)),
+                    (int, float),
+                )
                 and info.get("maximum", info.get("exclusiveMaximum", 2)) <= 1
+                and isinstance(
+                    info.get("minimum", info.get("exclusiveMinimum", -2)),
+                    (int, float),
+                )
                 and info.get("minimum", info.get("exclusiveMinimum", -2)) >= -1
-                and any(term in name.lower() for term in ("ratio", "pct", "effectiveness"))
+                and any(
+                    term in name.lower()
+                    for term in ("ratio", "pct", "effectiveness")
+                )
             ]
             if fractional:
                 details.append(
                     "Fractional percentage fields "
                     + ", ".join(fractional)
-                    + " use decimal fractions: 50% = 0.5, 80% = 0.8; "
-                    "for a negative market shock (queda de 10%), shock_pct = -0.10."
+                    + " use decimal fractions: 50% = 0.5, 80% = 0.8."
+                )
+            if spec.name == "analyze_hedge_scenario" and {
+                "position_value", "hedge_ratio", "shock_pct",
+                "hedge_effectiveness",
+            }.issubset(properties):
+                details.append(
+                    "Hedge semantics: position_value is the position amount; "
+                    "hedge_ratio is the protected fraction; hedge_effectiveness "
+                    "is the protection efficiency; shock_pct is SIGNED, so "
+                    "queda de 10% means shock_pct = -0.10. "
+                    "Example only (use the user's actual values): "
+                    '{"position_value":10000,"hedge_ratio":0.5,'
+                    '"shock_pct":-0.1,"hedge_effectiveness":0.8}.'
                 )
     if not details:
         return ""

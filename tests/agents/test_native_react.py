@@ -903,7 +903,7 @@ class TestNamedToolArgumentContracts:
         engine = MagicMock(engine_id="mock")
         engine.generate.side_effect = [
             _engine_response(
-                'Action: calculator\\nAction Input: {"expression":"2+2"}'
+                'Action: calculator\nAction Input: {"expression":"2+2"}'
             ),
             _engine_response("Final Answer: 4"),
         ]
@@ -920,10 +920,10 @@ class TestNamedToolArgumentContracts:
         engine = MagicMock(engine_id="mock")
         engine.generate.side_effect = [
             _engine_response(
-                'Action: calculator\\nAction Input: {"expression":"broken"}'
+                'Action: calculator\nAction Input: {"expression":"broken"}'
             ),
             _engine_response(
-                'Action: calculator\\nAction Input: {"expression":"broken"}'
+                'Action: calculator\nAction Input: {"expression":"broken"}'
             ),
         ]
         tool = _CalculatorStub()
