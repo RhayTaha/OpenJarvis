@@ -106,7 +106,8 @@ def setup_security(
                     requests_per_minute=config.security.rate_limit_rpm,
                     burst_size=config.security.rate_limit_burst,
                     enabled=True,
-                )
+                ),
+                require_rust=config.security.profile in {"shared", "server"},
             )
         except Exception as exc:
             if config.security.profile in {"shared", "server"}:

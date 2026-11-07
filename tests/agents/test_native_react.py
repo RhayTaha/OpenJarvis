@@ -729,3 +729,209 @@ def test_native_react_with_different_models(model):
     assert result.content == "Hello!"
     call_kwargs = engine.generate.call_args[1]
     assert call_kwargs["model"] == model
+
+
+class TestNamedToolGrounding:
+    def test_plain_fake_observation_retries_then_fails_closed(self):
+        engine = MagicMock(engine_id="mock")
+        engine.generate.side_effect = [
+            _engine_response("Observation: text_reverse returned ZYX"),
+            _engine_response("Final Answer: reversed text is ZYX"),
+        ]
+        tool = _ThinkStub()
+        agent = NativeReActAgent(engine, "test-model", tools=[tool])
+        # Name a real available tool but supply only fabricated model output.
+        result = agent.run("Use think with thought hello")
+        assert result.tool_results == []
+        assert result.metadata["tool_execution_unverified"] == ["think"]
+        assert "not verified" in result.content
+        assert engine.generate.call_count == 2
+
+    def test_wrong_prefix_is_resolved_only_for_registered_tool(self):
+        engine = MagicMock(engine_id="mock")
+        engine.generate.side_effect = [
+            _engine_response('Action: skill_calculator\nAction Input: {"expression":"2+2"}'),
+            _engine_response("Final Answer: 4"),
+        ]
+        tool = _CalculatorStub()
+        tool.execute = MagicMock(wraps=tool.execute)
+        agent = NativeReActAgent(engine, "test-model", tools=[tool])
+        result = agent.run("Use calculator to calculate 2+2")
+        assert len(result.tool_results) == 1
+        assert result.tool_results[0].tool_name == "calculator"
+        assert result.tool_results[0].success
+        tool.execute.assert_called_once_with(expression="2+2")
+        assert result.content == "4"
+
+    def test_failing_named_tool_cannot_be_reported_as_success(self):
+        engine = MagicMock(engine_id="mock")
+        engine.generate.side_effect = [
+            _engine_response('Action: calculator\nAction Input: {"expression":"broken"}'),
+            _engine_response("Final Answer: Successfully calculated 999"),
+            _engine_response("Final Answer: The answer is 999"),
+        ]
+        tool = _CalculatorStub()
+        agent = NativeReActAgent(engine, "test-model", tools=[tool])
+        result = agent.run("Execute calculator for broken")
+        assert not result.tool_results[0].success
+        assert result.metadata["tool_execution_unverified"] == ["calculator"]
+        assert "999" not in result.content
+
+    def test_normal_chat_does_not_require_tools(self):
+        engine = MagicMock(engine_id="mock")
+        engine.generate.return_value = _engine_response("Hello there!")
+        agent = NativeReActAgent(engine, "test-model", tools=[_CalculatorStub()])
+        result = agent.run("Hello!")
+        assert result.content == "Hello there!"
+        assert result.tool_results == []
+
+    def test_named_tool_success_allows_final_answer(self):
+        engine = MagicMock(engine_id="mock")
+        engine.generate.side_effect = [
+            _engine_response('Action: think\nAction Input: {"thought":"ok"}'),
+            _engine_response("Final Answer: ok"),
+        ]
+        result = NativeReActAgent(
+            engine, "test-model", tools=[_ThinkStub()]
+        ).run("Run think with thought ok")
+        assert result.tool_results[0].success
+        assert result.content == "ok"
+
+
+class TestRestrictedSkillPrefixResolution:
+    @pytest.mark.parametrize("prefix", ["skill.", "skill_"])
+    def test_named_tool_alias_executes_only_known_tool(self, prefix):
+        engine = MagicMock(engine_id="mock")
+        engine.generate.side_effect = [
+            _engine_response(
+                f'Action: {prefix}calculator\n'
+                'Action Input: {"expression":"2+2"}'
+            ),
+            _engine_response("Final Answer: 4"),
+        ]
+        tool = _CalculatorStub()
+        tool.execute = MagicMock(wraps=tool.execute)
+        result = NativeReActAgent(
+            engine, "test-model", tools=[tool]
+        ).run("Execute calculator for 2+2")
+        assert result.content == "4"
+        assert [call.tool_name for call in result.tool_results] == ["calculator"]
+        assert result.tool_results[0].success
+        tool.execute.assert_called_once_with(expression="2+2")
+
+    def test_exact_name_wins_over_alias(self):
+        from openjarvis.agents.native_react import _resolve_action_name
+
+        allowed = {"text_reverse", "skill.text_reverse"}
+        assert _resolve_action_name("skill.text_reverse", allowed) == (
+            "skill.text_reverse"
+        )
+
+    @pytest.mark.parametrize(
+        "name", [
+            "skill.delete_account", "skill_autohedge.place_order",
+            "skill.skill.text_reverse", "skill.text_reverse.extra",
+            "skill_Text_reverse",
+        ]
+    )
+    def test_unknown_or_nested_names_are_not_granted(self, name):
+        from openjarvis.agents.native_react import _resolve_action_name
+
+        assert _resolve_action_name(name, {"text_reverse"}) == name
+
+    def test_missing_tool_is_rejected_and_cannot_fake_success(self):
+        engine = MagicMock(engine_id="mock")
+        engine.generate.side_effect = [
+            _engine_response(
+                'Action: skill.delete_account\nAction Input: {}'
+            ),
+            _engine_response("Final Answer: deleted successfully"),
+            _engine_response("Final Answer: deleted successfully"),
+        ]
+        tool = _CalculatorStub()
+        result = NativeReActAgent(
+            engine, "test-model", tools=[tool]
+        ).run("Execute calculator")
+        assert not result.tool_results[0].success
+        assert result.tool_results[0].tool_name == "skill.delete_account"
+        assert result.metadata["tool_execution_unverified"] == ["calculator"]
+        assert "deleted successfully" not in result.content
+
+
+
+class TestNamedToolArgumentContracts:
+    def test_schema_and_fractional_guidance_for_explicit_tool(self):
+        from openjarvis.agents.native_react import _named_tool_contract_guidance
+
+        class HedgeTool(_ThinkStub):
+            @property
+            def spec(self):
+                return ToolSpec(
+                    name="analyze_hedge_scenario",
+                    description="Hypothetical hedge simulator",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "position_value": {"type": "number", "exclusiveMinimum": 0},
+                            "hedge_ratio": {
+                                "type": "number", "minimum": 0, "maximum": 1
+                            },
+                            "shock_pct": {
+                                "type": "number", "minimum": -0.95, "maximum": 1
+                            },
+                            "hedge_effectiveness": {
+                                "type": "number", "minimum": 0, "maximum": 1
+                            },
+                        },
+                        "required": [
+                            "position_value", "hedge_ratio", "shock_pct"
+                        ],
+                    },
+                )
+
+        tool = HedgeTool()
+        instructions = _named_tool_contract_guidance(
+            {"analyze_hedge_scenario"}, [tool]
+        )
+        assert "position_value" in instructions
+        assert "hedge_ratio" in instructions
+        assert "shock_pct = -0.10" in instructions
+        assert '"required"' in instructions
+        assert _named_tool_contract_guidance(set(), [tool]) == ""
+
+    def test_schema_is_sent_to_model_for_explicit_request(self):
+        engine = MagicMock(engine_id="mock")
+        engine.generate.side_effect = [
+            _engine_response(
+                'Action: calculator\nAction Input: {"expression":"2+2"}'
+            ),
+            _engine_response("Final Answer: 4"),
+        ]
+        tool = _CalculatorStub()
+        result = NativeReActAgent(
+            engine, "test-model", tools=[tool]
+        ).run("Use calculator to evaluate 2+2")
+        assert result.content == "4"
+        prompt = engine.generate.call_args_list[0].args[0][0].content
+        assert "Required tool argument contracts" in prompt
+        assert '"expression"' in prompt
+
+    def test_repeated_failed_input_does_not_execute_again(self):
+        engine = MagicMock(engine_id="mock")
+        engine.generate.side_effect = [
+            _engine_response(
+                'Action: calculator\nAction Input: {"expression":"broken"}'
+            ),
+            _engine_response(
+                'Action: calculator\nAction Input: {"expression":"broken"}'
+            ),
+        ]
+        tool = _CalculatorStub()
+        tool.execute = MagicMock(wraps=tool.execute)
+        result = NativeReActAgent(
+            engine, "test-model", tools=[tool]
+        ).run("Use calculator for broken")
+        assert result.metadata["repeated_failed_tool_call"] == "calculator"
+        assert len(result.tool_results) == 1
+        tool.execute.assert_called_once_with(expression="broken")
+        assert "No verified result" in result.content

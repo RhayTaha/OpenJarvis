@@ -33,6 +33,15 @@ Action Input: <json arguments>
 Thought: <your reasoning>
 Final Answer: <your answer>
 
+If a user requests one of the tools listed below, issue an Action with its
+exact name and JSON object arguments before you answer. Do not claim a tool
+was executed unless you received an Observation containing its result.
+If no tool call was made, clearly say that you did not use a tool.
+Never invent an Observation: only the runtime can supply tool observations.
+The only callable tool names are those listed in the available tools section.
+Do not add `skill_` or `skill.` to a tool name that does not have it.
+If a tool fails, report the failure rather than pretending it succeeded.
+
 # Using Skills
 
 Tools whose names begin with `skill_` are SKILLS. When you call a skill tool,
@@ -126,6 +135,97 @@ def _parse_json_response(text: str) -> dict[str, str]:
                 "object action_input, or a nonempty final_answer."
             ),
         }
+
+
+
+def _resolve_action_name(action: str, available_names: set[str]) -> str:
+    """Resolve only a single, known synthetic skill prefix.
+
+    Exact names always win. Unknown actions remain unknown so ToolExecutor
+    applies its usual denial; this never adds a new executable capability.
+    """
+    if action in available_names:
+        return action
+    for prefix in ("skill.", "skill_"):
+        if action.startswith(prefix):
+            candidate = action[len(prefix) :]
+            if candidate in available_names:
+                return candidate
+    return action
+
+
+
+def _named_tool_contract_guidance(
+    requested: set[str], tools: List[BaseTool]
+) -> str:
+    """Provide exact MCP JSON schemas for explicitly named tools only.
+
+    Generated from advertised ToolSpec rather than trusting the model to
+    infer parameter names. No arguments are fabricated or executed here.
+    """
+    details = []
+    for tool in tools:
+        spec = tool.spec
+        if spec.name not in requested:
+            continue
+        schema = spec.parameters
+        if not isinstance(schema, dict):
+            continue
+        encoded = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded) > 6000:
+            continue
+        details.append(f"Tool {spec.name} input JSON Schema: {encoded}")
+        properties = schema.get("properties", {})
+        if isinstance(properties, dict):
+            fractional = [
+                name
+                for name, info in properties.items()
+                if isinstance(info, dict)
+                and info.get("type") in ("number", "integer")
+                and isinstance(
+                    info.get("maximum", info.get("exclusiveMaximum", 2)),
+                    (int, float),
+                )
+                and info.get("maximum", info.get("exclusiveMaximum", 2)) <= 1
+                and isinstance(
+                    info.get("minimum", info.get("exclusiveMinimum", -2)),
+                    (int, float),
+                )
+                and info.get("minimum", info.get("exclusiveMinimum", -2)) >= -1
+                and any(
+                    term in name.lower()
+                    for term in ("ratio", "pct", "effectiveness")
+                )
+            ]
+            if fractional:
+                details.append(
+                    "Fractional percentage fields "
+                    + ", ".join(fractional)
+                    + " use decimal fractions: 50% = 0.5, 80% = 0.8."
+                )
+            if spec.name == "analyze_hedge_scenario" and {
+                "position_value", "hedge_ratio", "shock_pct",
+                "hedge_effectiveness",
+            }.issubset(properties):
+                details.append(
+                    "Hedge semantics: position_value is the position amount; "
+                    "hedge_ratio is the protected fraction; hedge_effectiveness "
+                    "is the protection efficiency; shock_pct is SIGNED, so "
+                    "queda de 10% means shock_pct = -0.10. "
+                    "Example only (use the user's actual values): "
+                    '{"position_value":10000,"hedge_ratio":0.5,'
+                    '"shock_pct":-0.1,"hedge_effectiveness":0.8}.'
+                )
+    if not details:
+        return ""
+    return (
+        "\n\n# Required tool argument contracts\n"
+        + "\n".join(details)
+        + "\nUse exact field names and JSON numbers, not prose or percentages. "
+        "Do not guess missing parameters. If a tool rejects input, read the "
+        "error, correct only supported parameters, and retry at most once per "
+        "distinct failed argument set.\n"
+    )
 
 
 @AgentRegistry.register("native_react")
@@ -230,6 +330,14 @@ class NativeReActAgent(ToolUsingAgent):
     ) -> AgentResult:
         self._emit_turn_start(input)
 
+        # Ground named tool requests in the exact published input schemas.
+        available_names = {tool.spec.name for tool in self._tools}
+        requested_names = {
+            name
+            for name in available_names
+            if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", input)
+        }
+        contract_guidance = _named_tool_contract_guidance(requested_names, self._tools)
         # Build system prompt with rich tool descriptions
         tool_desc = build_tool_descriptions(self._tools)
         # Plan 2B I3: render optimized few-shot skill examples as a section
@@ -257,6 +365,8 @@ class NativeReActAgent(ToolUsingAgent):
             if skill_examples_block:
                 system_prompt = system_prompt + "\n\n" + skill_examples_block
 
+        if contract_guidance:
+            system_prompt += contract_guidance
         messages = self._build_messages(input, context, system_prompt=system_prompt)
 
         # Inject few-shot exemplars before the user input
@@ -265,6 +375,12 @@ class NativeReActAgent(ToolUsingAgent):
                 messages.insert(-1, Message(role=Role.USER, content=ex["input"]))
                 messages.insert(-1, Message(role=Role.ASSISTANT, content=ex["output"]))
 
+        # Only enforce tool use when the user explicitly names an installed tool.
+        # Do not infer a tool from arbitrary user requests or model-generated text.
+        # This prevents a small model from fabricating results when explicitly
+        # asked to execute a tool, without forcing tools on ordinary chat.
+        retry_count = 0
+        failed_calls: set[tuple[str, str]] = set()
         all_tool_results: list[ToolResult] = []
         turns = 0
         total_usage: dict[str, int] = {
@@ -301,6 +417,51 @@ class NativeReActAgent(ToolUsingAgent):
                     },
                 )
 
+            # The model is not allowed to claim success for a named tool
+            # without an actual successful ToolExecutor invocation.
+            pending_names = {
+                name
+                for name in requested_names
+                if not any(
+                    item.tool_name == name and item.success
+                    for item in all_tool_results
+                )
+            }
+            if pending_names and (parsed["final_answer"] or not parsed["action"]):
+                if retry_count < 1 and turns < self._max_turns:
+                    retry_count += 1
+                    # Never feed invented observations back as tool outputs.
+                    messages.append(
+                        Message(
+                            role=Role.USER,
+                            content=(
+                                "The requested tool has NOT executed successfully. "
+                                "Your previous response was not a tool result. "
+                                "Issue an Action with an exact available tool name "
+                                "and JSON object Action Input. "
+                                "Required tool names: "
+                                + ", ".join(sorted(pending_names))
+                                + ". Do not write an Observation yourself."
+                            ),
+                        )
+                    )
+                    continue
+                self._emit_turn_end(turns=turns)
+                return AgentResult(
+                    content=(
+                        "Tool execution was not verified for: "
+                        + ", ".join(sorted(pending_names))
+                        + ". No result is reported."
+                    ),
+                    tool_results=all_tool_results,
+                    turns=turns,
+                    metadata={
+                        **total_usage,
+                        "tool_execution_unverified": sorted(pending_names),
+                        "messages": [_message_to_dict(m) for m in messages],
+                    },
+                )
+
             # Final answer?
             if parsed["final_answer"]:
                 self._emit_turn_end(turns=turns)
@@ -326,9 +487,13 @@ class NativeReActAgent(ToolUsingAgent):
             # Execute action
             messages.append(Message(role=Role.ASSISTANT, content=content))
 
+            # Resolve model-invented skill prefixes only against the exact
+            # registered tool names. The executor still applies its ordinary
+            # capability checks, confirmation gates, and rate limits.
+            action_name = _resolve_action_name(parsed["action"], available_names)
             tool_call = ToolCall(
                 id=f"react_{turns}",
-                name=parsed["action"],
+                name=action_name,
                 arguments=parsed["action_input"] or "{}",
             )
 
@@ -349,12 +514,63 @@ class NativeReActAgent(ToolUsingAgent):
                     messages.append(Message(role=Role.USER, content=observation))
                     continue
 
+            # Repeated invalid JSON arguments cannot improve an outcome.
+            # Avoid burning multiple model turns on identical failed calls.
+            signature = (tool_call.name, tool_call.arguments)
+            if signature in failed_calls:
+                self._emit_turn_end(turns=turns)
+                return AgentResult(
+                    content=(
+                        f"Tool {tool_call.name} repeated a failed request. "
+                        "No verified result is available. "
+                        "Use /tool with the documented JSON arguments."
+                    ),
+                    tool_results=all_tool_results,
+                    turns=turns,
+                    metadata={
+                        **total_usage,
+                        "repeated_failed_tool_call": tool_call.name,
+                        "messages": [_message_to_dict(m) for m in messages],
+                    },
+                )
             tool_result = self._executor.execute(tool_call)
             all_tool_results.append(tool_result)
-
-            observation = f"Observation: {tool_result.content}"
+            if not tool_result.success:
+                failed_calls.add(signature)
+                observation = (
+                    "Observation: TOOL EXECUTION FAILED for "
+                    + tool_call.name
+                    + ". Error: "
+                    + str(tool_result.content)
+                    + "\nThe preceding call did not produce a verified result. "
+                    "Correct the tool arguments using the published schema, "
+                    "or report failure. Never invent a successful result."
+                )
+            else:
+                observation = f"Observation: {tool_result.content}"
             messages.append(Message(role=Role.USER, content=observation))
 
+        # A named tool that never succeeded must fail closed even if the
+        # model spent all turns proposing invalid actions.
+        unverified = {
+            name
+            for name in requested_names
+            if not any(item.tool_name == name and item.success for item in all_tool_results)
+        }
+        if unverified:
+            self._emit_turn_end(turns=turns)
+            return AgentResult(
+                content="Tool execution was not verified for: "
+                + ", ".join(sorted(unverified))
+                + ". No result is reported.",
+                tool_results=all_tool_results,
+                turns=turns,
+                metadata={
+                    **total_usage,
+                    "tool_execution_unverified": sorted(unverified),
+                    "messages": [_message_to_dict(m) for m in messages],
+                },
+            )
         # Max turns exceeded
         msg_dicts = [_message_to_dict(m) for m in messages]
         return self._max_turns_result(
