@@ -7,6 +7,10 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 __all__ = ["RateLimitConfig", "RateLimiter", "TokenBucket"]
 
 
@@ -62,24 +66,42 @@ class RateLimiter:
     Keys are typically "agent_id:tool_name" or just "agent_id".
     """
 
-    def __init__(self, config: Optional[RateLimitConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[RateLimitConfig] = None,
+        *,
+        require_rust: bool = False,
+    ) -> None:
         self._config = config or RateLimitConfig()
+        if self._config.requests_per_minute <= 0 or self._config.burst_size <= 0:
+            raise ValueError("Rate limit RPM and burst size must be positive")
         self._buckets: Dict[str, TokenBucket] = {}
         self._lock = threading.Lock()
+        self._rust_impl = None
 
-        from openjarvis._rust_bridge import get_rust_module
+        try:
+            from openjarvis._rust_bridge import get_rust_module
 
-        _rust = get_rust_module()
-        self._rust_impl = _rust.RateLimiter(
-            requests_per_minute=self._config.requests_per_minute,
-            burst_size=self._config.burst_size,
-        )
+            _rust = get_rust_module()
+            self._rust_impl = _rust.RateLimiter(
+                requests_per_minute=self._config.requests_per_minute,
+                burst_size=self._config.burst_size,
+            )
+        except (ImportError, AttributeError):
+            if require_rust:
+                raise
+            logger.info(
+                "Native Rust limiter unavailable; using the thread-safe "
+                "Python token bucket for the local personal profile"
+            )
 
     def check(self, key: str) -> Tuple[bool, float]:
-        """Check if request is allowed for key — always via Rust backend."""
+        """Check requests with Rust, or safe local-only Python token bucket."""
         if not self._config.enabled:
             return True, 0.0
-        return self._rust_impl.check(key)
+        if self._rust_impl is not None:
+            return self._rust_impl.check(key)
+        return self._get_bucket(key).consume()
 
     def _get_bucket(self, key: str) -> TokenBucket:
         """Get or create a bucket for the given key."""
@@ -93,11 +115,12 @@ class RateLimiter:
             return self._buckets[key]
 
     def reset(self, key: Optional[str] = None) -> None:
-        """Reset rate limit state for a key or all keys — always via Rust backend."""
-        self._rust_impl.reset(key)
-        return
+        """Reset the selected key or the complete throttle state."""
+        if self._rust_impl is not None:
+            self._rust_impl.reset(key)
+            return
         with self._lock:
-            if key:
+            if key is not None:
                 self._buckets.pop(key, None)
             else:
                 self._buckets.clear()

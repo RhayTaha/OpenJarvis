@@ -138,3 +138,34 @@ class TestRateLimiter:
         assert limiter.config.requests_per_minute == 60
         assert limiter.config.burst_size == 10
         assert limiter.config.enabled is True
+
+
+class TestPythonFallbackSafety:
+    def test_local_fallback_enforces_burst_and_reset(self, monkeypatch):
+        from openjarvis import _rust_bridge
+
+        def no_native():
+            raise ImportError("native unavailable")
+
+        monkeypatch.setattr(_rust_bridge, "get_rust_module", no_native)
+        limiter = RateLimiter(
+            RateLimitConfig(requests_per_minute=60, burst_size=2),
+            require_rust=False,
+        )
+        assert limiter.check("local")[0] is True
+        assert limiter.check("local")[0] is True
+        assert limiter.check("local")[0] is False
+        assert limiter.check("other")[0] is True
+        limiter.reset("local")
+        assert limiter.check("local")[0] is True
+
+    def test_shared_and_server_reject_missing_native(self, monkeypatch):
+        import pytest
+        from openjarvis import _rust_bridge
+
+        def no_native():
+            raise ImportError("native unavailable")
+
+        monkeypatch.setattr(_rust_bridge, "get_rust_module", no_native)
+        with pytest.raises(ImportError):
+            RateLimiter(RateLimitConfig(), require_rust=True)
