@@ -856,3 +856,82 @@ class TestRestrictedSkillPrefixResolution:
         assert result.tool_results[0].tool_name == "skill.delete_account"
         assert result.metadata["tool_execution_unverified"] == ["calculator"]
         assert "deleted successfully" not in result.content
+
+
+
+class TestNamedToolArgumentContracts:
+    def test_schema_and_fractional_guidance_for_explicit_tool(self):
+        from openjarvis.agents.native_react import _named_tool_contract_guidance
+
+        class HedgeTool(_ThinkStub):
+            @property
+            def spec(self):
+                return ToolSpec(
+                    name="analyze_hedge_scenario",
+                    description="Hypothetical hedge simulator",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "position_value": {"type": "number", "exclusiveMinimum": 0},
+                            "hedge_ratio": {
+                                "type": "number", "minimum": 0, "maximum": 1
+                            },
+                            "shock_pct": {
+                                "type": "number", "minimum": -0.95, "maximum": 1
+                            },
+                            "hedge_effectiveness": {
+                                "type": "number", "minimum": 0, "maximum": 1
+                            },
+                        },
+                        "required": [
+                            "position_value", "hedge_ratio", "shock_pct"
+                        ],
+                    },
+                )
+
+        tool = HedgeTool()
+        instructions = _named_tool_contract_guidance(
+            {"analyze_hedge_scenario"}, [tool]
+        )
+        assert "position_value" in instructions
+        assert "hedge_ratio" in instructions
+        assert "shock_pct = -0.10" in instructions
+        assert '"required"' in instructions
+        assert _named_tool_contract_guidance(set(), [tool]) == ""
+
+    def test_schema_is_sent_to_model_for_explicit_request(self):
+        engine = MagicMock(engine_id="mock")
+        engine.generate.side_effect = [
+            _engine_response(
+                'Action: calculator\\nAction Input: {"expression":"2+2"}'
+            ),
+            _engine_response("Final Answer: 4"),
+        ]
+        tool = _CalculatorStub()
+        result = NativeReActAgent(
+            engine, "test-model", tools=[tool]
+        ).run("Use calculator to evaluate 2+2")
+        assert result.content == "4"
+        prompt = engine.generate.call_args_list[0].args[0][0].content
+        assert "Required tool argument contracts" in prompt
+        assert '"expression"' in prompt
+
+    def test_repeated_failed_input_does_not_execute_again(self):
+        engine = MagicMock(engine_id="mock")
+        engine.generate.side_effect = [
+            _engine_response(
+                'Action: calculator\\nAction Input: {"expression":"broken"}'
+            ),
+            _engine_response(
+                'Action: calculator\\nAction Input: {"expression":"broken"}'
+            ),
+        ]
+        tool = _CalculatorStub()
+        tool.execute = MagicMock(wraps=tool.execute)
+        result = NativeReActAgent(
+            engine, "test-model", tools=[tool]
+        ).run("Use calculator for broken")
+        assert result.metadata["repeated_failed_tool_call"] == "calculator"
+        assert len(result.tool_results) == 1
+        tool.execute.assert_called_once_with(expression="broken")
+        assert "No verified result" in result.content

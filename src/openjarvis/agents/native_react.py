@@ -154,6 +154,57 @@ def _resolve_action_name(action: str, available_names: set[str]) -> str:
     return action
 
 
+
+def _named_tool_contract_guidance(
+    requested: set[str], tools: List[BaseTool]
+) -> str:
+    """Provide exact MCP JSON schemas for explicitly named tools only.
+
+    Generated from advertised ToolSpec rather than trusting the model to
+    infer parameter names. No arguments are fabricated or executed here.
+    """
+    details = []
+    for tool in tools:
+        spec = tool.spec
+        if spec.name not in requested:
+            continue
+        schema = spec.parameters
+        if not isinstance(schema, dict):
+            continue
+        encoded = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded) > 6000:
+            continue
+        details.append(f"Tool {spec.name} input JSON Schema: {encoded}")
+        properties = schema.get("properties", {})
+        if isinstance(properties, dict):
+            fractional = [
+                name
+                for name, info in properties.items()
+                if isinstance(info, dict)
+                and info.get("type") in ("number", "integer")
+                and info.get("maximum", info.get("exclusiveMaximum", 2)) <= 1
+                and info.get("minimum", info.get("exclusiveMinimum", -2)) >= -1
+                and any(term in name.lower() for term in ("ratio", "pct", "effectiveness"))
+            ]
+            if fractional:
+                details.append(
+                    "Fractional percentage fields "
+                    + ", ".join(fractional)
+                    + " use decimal fractions: 50% = 0.5, 80% = 0.8; "
+                    "for a negative market shock (queda de 10%), shock_pct = -0.10."
+                )
+    if not details:
+        return ""
+    return (
+        "\n\n# Required tool argument contracts\n"
+        + "\n".join(details)
+        + "\nUse exact field names and JSON numbers, not prose or percentages. "
+        "Do not guess missing parameters. If a tool rejects input, read the "
+        "error, correct only supported parameters, and retry at most once per "
+        "distinct failed argument set.\n"
+    )
+
+
 @AgentRegistry.register("native_react")
 class NativeReActAgent(ToolUsingAgent):
     """ReAct agent: Thought -> Action -> Observation loop."""
@@ -256,6 +307,14 @@ class NativeReActAgent(ToolUsingAgent):
     ) -> AgentResult:
         self._emit_turn_start(input)
 
+        # Ground named tool requests in the exact published input schemas.
+        available_names = {tool.spec.name for tool in self._tools}
+        requested_names = {
+            name
+            for name in available_names
+            if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", input)
+        }
+        contract_guidance = _named_tool_contract_guidance(requested_names, self._tools)
         # Build system prompt with rich tool descriptions
         tool_desc = build_tool_descriptions(self._tools)
         # Plan 2B I3: render optimized few-shot skill examples as a section
@@ -283,6 +342,8 @@ class NativeReActAgent(ToolUsingAgent):
             if skill_examples_block:
                 system_prompt = system_prompt + "\n\n" + skill_examples_block
 
+        if contract_guidance:
+            system_prompt += contract_guidance
         messages = self._build_messages(input, context, system_prompt=system_prompt)
 
         # Inject few-shot exemplars before the user input
@@ -295,13 +356,8 @@ class NativeReActAgent(ToolUsingAgent):
         # Do not infer a tool from arbitrary user requests or model-generated text.
         # This prevents a small model from fabricating results when explicitly
         # asked to execute a tool, without forcing tools on ordinary chat.
-        available_names = {tool.spec.name for tool in self._tools}
-        requested_names = {
-            name
-            for name in available_names
-            if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", input)
-        }
         retry_count = 0
+        failed_calls: set[tuple[str, str]] = set()
         all_tool_results: list[ToolResult] = []
         turns = 0
         total_usage: dict[str, int] = {
@@ -435,10 +491,40 @@ class NativeReActAgent(ToolUsingAgent):
                     messages.append(Message(role=Role.USER, content=observation))
                     continue
 
+            # Repeated invalid JSON arguments cannot improve an outcome.
+            # Avoid burning multiple model turns on identical failed calls.
+            signature = (tool_call.name, tool_call.arguments)
+            if signature in failed_calls:
+                self._emit_turn_end(turns=turns)
+                return AgentResult(
+                    content=(
+                        f"Tool {tool_call.name} repeated a failed request. "
+                        "No verified result is available. "
+                        "Use /tool with the documented JSON arguments."
+                    ),
+                    tool_results=all_tool_results,
+                    turns=turns,
+                    metadata={
+                        **total_usage,
+                        "repeated_failed_tool_call": tool_call.name,
+                        "messages": [_message_to_dict(m) for m in messages],
+                    },
+                )
             tool_result = self._executor.execute(tool_call)
             all_tool_results.append(tool_result)
-
-            observation = f"Observation: {tool_result.content}"
+            if not tool_result.success:
+                failed_calls.add(signature)
+                observation = (
+                    "Observation: TOOL EXECUTION FAILED for "
+                    + tool_call.name
+                    + ". Error: "
+                    + str(tool_result.content)
+                    + "\nThe preceding call did not produce a verified result. "
+                    "Correct the tool arguments using the published schema, "
+                    "or report failure. Never invent a successful result."
+                )
+            else:
+                observation = f"Observation: {tool_result.content}"
             messages.append(Message(role=Role.USER, content=observation))
 
         # A named tool that never succeeded must fail closed even if the
