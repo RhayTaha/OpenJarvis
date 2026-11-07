@@ -747,29 +747,28 @@ class TestNamedToolGrounding:
         assert "not verified" in result.content
         assert engine.generate.call_count == 2
 
-    def test_wrong_prefix_is_never_auto_authorized(self):
+    def test_wrong_prefix_is_resolved_only_for_registered_tool(self):
         engine = MagicMock(engine_id="mock")
         engine.generate.side_effect = [
-            _engine_response('Action: skill_calculator\\nAction Input: {"expression":"2+2"}'),
+            _engine_response('Action: skill_calculator\nAction Input: {"expression":"2+2"}'),
             _engine_response("Final Answer: The answer is 4"),
-            _engine_response('Action: calculator\\nAction Input: {"expression":"2+2"}'),
+            _engine_response('Action: calculator\nAction Input: {"expression":"2+2"}'),
             _engine_response("Final Answer: 4"),
         ]
         tool = _CalculatorStub()
         tool.execute = MagicMock(wraps=tool.execute)
         agent = NativeReActAgent(engine, "test-model", tools=[tool])
         result = agent.run("Use calculator to calculate 2+2")
-        assert len(result.tool_results) == 2
-        assert result.tool_results[0].tool_name == "skill_calculator"
-        assert not result.tool_results[0].success
-        assert result.tool_results[1].success
+        assert len(result.tool_results) == 1
+        assert result.tool_results[0].tool_name == "calculator"
+        assert result.tool_results[0].success
         tool.execute.assert_called_once_with(expression="2+2")
         assert result.content == "4"
 
     def test_failing_named_tool_cannot_be_reported_as_success(self):
         engine = MagicMock(engine_id="mock")
         engine.generate.side_effect = [
-            _engine_response('Action: calculator\\nAction Input: {"expression":"broken"}'),
+            _engine_response('Action: calculator\nAction Input: {"expression":"broken"}'),
             _engine_response("Final Answer: Successfully calculated 999"),
             _engine_response("Final Answer: The answer is 999"),
         ]
@@ -791,7 +790,7 @@ class TestNamedToolGrounding:
     def test_named_tool_success_allows_final_answer(self):
         engine = MagicMock(engine_id="mock")
         engine.generate.side_effect = [
-            _engine_response('Action: think\\nAction Input: {"thought":"ok"}'),
+            _engine_response('Action: think\nAction Input: {"thought":"ok"}'),
             _engine_response("Final Answer: ok"),
         ]
         result = NativeReActAgent(
@@ -799,3 +798,63 @@ class TestNamedToolGrounding:
         ).run("Run think with thought ok")
         assert result.tool_results[0].success
         assert result.content == "ok"
+
+
+class TestRestrictedSkillPrefixResolution:
+    @pytest.mark.parametrize("prefix", ["skill.", "skill_"])
+    def test_named_tool_alias_executes_only_known_tool(self, prefix):
+        engine = MagicMock(engine_id="mock")
+        engine.generate.side_effect = [
+            _engine_response(
+                f'Action: {prefix}calculator\\n'
+                'Action Input: {"expression":"2+2"}'
+            ),
+            _engine_response("Final Answer: 4"),
+        ]
+        tool = _CalculatorStub()
+        tool.execute = MagicMock(wraps=tool.execute)
+        result = NativeReActAgent(
+            engine, "test-model", tools=[tool]
+        ).run("Execute calculator for 2+2")
+        assert result.content == "4"
+        assert [call.tool_name for call in result.tool_results] == ["calculator"]
+        assert result.tool_results[0].success
+        tool.execute.assert_called_once_with(expression="2+2")
+
+    def test_exact_name_wins_over_alias(self):
+        from openjarvis.agents.native_react import _resolve_action_name
+
+        allowed = {"text_reverse", "skill.text_reverse"}
+        assert _resolve_action_name("skill.text_reverse", allowed) == (
+            "skill.text_reverse"
+        )
+
+    @pytest.mark.parametrize(
+        "name", [
+            "skill.delete_account", "skill_autohedge.place_order",
+            "skill.skill.text_reverse", "skill.text_reverse.extra",
+            "skill_Text_reverse",
+        ]
+    )
+    def test_unknown_or_nested_names_are_not_granted(self, name):
+        from openjarvis.agents.native_react import _resolve_action_name
+
+        assert _resolve_action_name(name, {"text_reverse"}) == name
+
+    def test_missing_tool_is_rejected_and_cannot_fake_success(self):
+        engine = MagicMock(engine_id="mock")
+        engine.generate.side_effect = [
+            _engine_response(
+                'Action: skill.delete_account\\nAction Input: {}'
+            ),
+            _engine_response("Final Answer: deleted successfully"),
+            _engine_response("Final Answer: deleted successfully"),
+        ]
+        tool = _CalculatorStub()
+        result = NativeReActAgent(
+            engine, "test-model", tools=[tool]
+        ).run("Execute calculator")
+        assert not result.tool_results[0].success
+        assert result.tool_results[0].tool_name == "skill.delete_account"
+        assert result.metadata["tool_execution_unverified"] == ["calculator"]
+        assert "deleted successfully" not in result.content

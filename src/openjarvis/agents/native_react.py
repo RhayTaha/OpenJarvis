@@ -39,7 +39,7 @@ was executed unless you received an Observation containing its result.
 If no tool call was made, clearly say that you did not use a tool.
 Never invent an Observation: only the runtime can supply tool observations.
 The only callable tool names are those listed in the available tools section.
-Do not add a `skill_` prefix to a tool name that does not have one.
+Do not add `skill_` or `skill.` to a tool name that does not have it.
 If a tool fails, report the failure rather than pretending it succeeded.
 
 # Using Skills
@@ -135,6 +135,23 @@ def _parse_json_response(text: str) -> dict[str, str]:
                 "object action_input, or a nonempty final_answer."
             ),
         }
+
+
+
+def _resolve_action_name(action: str, available_names: set[str]) -> str:
+    """Resolve only a single, known synthetic skill prefix.
+
+    Exact names always win. Unknown actions remain unknown so ToolExecutor
+    applies its usual denial; this never adds a new executable capability.
+    """
+    if action in available_names:
+        return action
+    for prefix in ("skill.", "skill_"):
+        if action.startswith(prefix):
+            candidate = action[len(prefix) :]
+            if candidate in available_names:
+                return candidate
+    return action
 
 
 @AgentRegistry.register("native_react")
@@ -391,9 +408,13 @@ class NativeReActAgent(ToolUsingAgent):
             # Execute action
             messages.append(Message(role=Role.ASSISTANT, content=content))
 
+            # Resolve model-invented skill prefixes only against the exact
+            # registered tool names. The executor still applies its ordinary
+            # capability checks, confirmation gates, and rate limits.
+            action_name = _resolve_action_name(parsed["action"], available_names)
             tool_call = ToolCall(
                 id=f"react_{turns}",
-                name=parsed["action"],
+                name=action_name,
                 arguments=parsed["action_input"] or "{}",
             )
 
