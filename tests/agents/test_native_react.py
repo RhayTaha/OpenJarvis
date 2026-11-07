@@ -751,8 +751,6 @@ class TestNamedToolGrounding:
         engine = MagicMock(engine_id="mock")
         engine.generate.side_effect = [
             _engine_response('Action: skill_calculator\nAction Input: {"expression":"2+2"}'),
-            _engine_response("Final Answer: The answer is 4"),
-            _engine_response('Action: calculator\nAction Input: {"expression":"2+2"}'),
             _engine_response("Final Answer: 4"),
         ]
         tool = _CalculatorStub()
@@ -806,7 +804,7 @@ class TestRestrictedSkillPrefixResolution:
         engine = MagicMock(engine_id="mock")
         engine.generate.side_effect = [
             _engine_response(
-                f'Action: {prefix}calculator\\n'
+                f'Action: {prefix}calculator\n'
                 'Action Input: {"expression":"2+2"}'
             ),
             _engine_response("Final Answer: 4"),
@@ -845,7 +843,7 @@ class TestRestrictedSkillPrefixResolution:
         engine = MagicMock(engine_id="mock")
         engine.generate.side_effect = [
             _engine_response(
-                'Action: skill.delete_account\\nAction Input: {}'
+                'Action: skill.delete_account\nAction Input: {}'
             ),
             _engine_response("Final Answer: deleted successfully"),
             _engine_response("Final Answer: deleted successfully"),
